@@ -1,7 +1,11 @@
-"""Agentbelt model proxy (ADR-0001) — OpenAI-compatible /v1/chat/completions.
+"""Agentbelt model proxy (ADR-0001).
 
-Wires the MVP denial-of-wallet slice end to end
-(docs/lld/mvp-denial-of-wallet-slice.md):
+The guard pipeline is protocol-agnostic and runs behind pluggable **ingress adapters**
+(see agentbelt/ingress.py and docs/design/agent-integration.md). Today the OpenAI-compatible
+/v1/chat/completions adapter is wired; new agent runtimes (e.g. Anthropic Messages for Claude Code)
+add an adapter without touching the guards.
+
+Per-turn flow (unchanged):
 
     client -> H0 budget admission -> H1 scope guard -> Cedar PDP AdmitInput
            -> upstream model (mockable) -> H5-lite output scope check
@@ -13,35 +17,21 @@ OPEN-with-alert. A *confident* offscope verdict is a deflection, not a failure.
 from __future__ import annotations
 
 import os
-import uuid
 from dataclasses import replace
 from typing import Callable
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 
+from agentbelt.ingress import ChatCompletionsAdapter, TurnRequest, _BLOCKED_ACTION_MSG, _est_tokens
 from agentbelt.mcp_discovery import discover_annotations
 from agentbelt.plugins import resolve as resolve_provider
 from agentbelt.telemetry import AuditSink
 from agentbelt.tooltier import resolve_tier
-from agentbelt.types import AuthzRequest, Message, AgentbeltConfig, Session, TelemetryRecord
+from agentbelt.types import AgentbeltConfig, AuthzRequest, Message, Session, TelemetryRecord
 
 Upstream = Callable[[dict], dict]
 
-_BLOCKED_ACTION_MSG = "I'm not able to complete that action."
-
-
-def _est_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
-
-
-def _completion(content: str, usage: dict | None = None) -> dict:
-    return {
-        "id": f"agentbelt-{uuid.uuid4().hex[:12]}",
-        "object": "chat.completion",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
+__all__ = ["create_app", "_BLOCKED_ACTION_MSG"]  # _BLOCKED_ACTION_MSG re-exported for back-compat
 
 
 def _default_upstream(base_url: str) -> Upstream:
@@ -83,11 +73,9 @@ def create_app(cfg: AgentbeltConfig, upstream: Upstream | None = None, mcp_fetch
             sessions[key] = s
         return s
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request) -> JSONResponse:
-        body = await request.json()
-        session = get_session(request)
-        msgs = [Message(m.get("role", ""), m.get("content", "") or "") for m in body.get("messages", [])]
+    def run_pipeline(adapter, upstream_call, req: TurnRequest, session: Session):
+        """Protocol-agnostic guard pipeline. `adapter` serializes each outcome to the wire format."""
+        msgs = req.messages
         last_user = next((m.content for m in reversed(msgs) if m.role == "user"), "")
 
         # --- H0: budget admission (fail-closed) ---
@@ -95,7 +83,7 @@ def create_app(cfg: AgentbeltConfig, upstream: Upstream | None = None, mcp_fetch
         if not br.allowed:
             audit.emit(TelemetryRecord(session.id, session.principal_key, "AdmitInput",
                                        "throttle", [br.reason], cost_used=session.cost_used))
-            return JSONResponse(status_code=429, content={"error": {"message": br.reason, "type": "rate_limit"}})
+            return adapter.throttle(br.reason)
 
         # --- H1: scope guard (fail-open-with-alert on error) ---
         try:
@@ -124,23 +112,21 @@ def create_app(cfg: AgentbeltConfig, upstream: Upstream | None = None, mcp_fetch
                                        "deflect", reasons, scope_verdict=effective_verdict,
                                        cost_used=session.cost_used,
                                        extra={"risk_score": round(rr.score, 3), "risk_tripped": rr.tripped}))
-            return JSONResponse(content=_completion(cfg.scope.deflect_message))
+            return adapter.deflect(cfg.scope.deflect_message)
 
         # --- H2: provenance of this turn (degrades to "untrusted" if NEW untrusted content) ---
-        turn_trust = provenance.turn_trust(session, body.get("messages", []))
+        turn_trust = provenance.turn_trust(session, req.raw_messages)
 
         # --- upstream model call ---
-        resp = up(body)
-        message = (resp.get("choices", [{}])[0].get("message", {})) or {}
-        usage = resp.get("usage") or {}
-        in_tok = int(usage.get("prompt_tokens") or _est_tokens(last_user))
+        up_res = adapter.call_upstream(upstream_call, req)
+        in_tok = int(up_res.prompt_tokens or _est_tokens(last_user))
 
         # --- H3: tool/action mediation (capability-downgrade) ---
-        tool_calls = message.get("tool_calls") or []
+        tool_calls = up_res.tool_calls
         if tool_calls:
             # tool metadata (MCP annotations + server) the host/MCP-proxy attached to tool defs
             tool_meta = {}
-            for t in body.get("tools", []) or []:
+            for t in req.tools:
                 fn = t.get("function") or {}
                 if fn.get("name"):
                     tool_meta[fn["name"]] = (fn.get("annotations"), fn.get("x_mcp_server"))
@@ -169,13 +155,12 @@ def create_app(cfg: AgentbeltConfig, upstream: Upstream | None = None, mcp_fetch
                        cost_used=session.cost_used,
                        extra={"provenance": turn_trust, "denied": denied}))
             if not kept:
-                return JSONResponse(content=_completion(_BLOCKED_ACTION_MSG))
-            message["tool_calls"] = kept
-            return JSONResponse(content=resp)  # forward upstream resp with denied calls stripped
+                return adapter.blocked_action()
+            return adapter.forward_tools(up_res, kept)
 
         # --- content path: H5-lite output scope + H6 egress ---
-        content = message.get("content", "") or ""
-        out_tok = int(usage.get("completion_tokens") or _est_tokens(content))
+        content = up_res.content or ""
+        out_tok = int(up_res.completion_tokens or _est_tokens(content))
         out_blocked = False
         if scope_guard.evaluate([Message("user", content)], cfg.scope).verdict == "offscope":
             content, out_blocked = cfg.scope.deflect_message, True
@@ -194,8 +179,15 @@ def create_app(cfg: AgentbeltConfig, upstream: Upstream | None = None, mcp_fetch
                                    "allow", scope_verdict=verdict, cost_used=session.cost_used,
                                    extra={"egress_blocked": blocked, "output_blocked": out_blocked,
                                           "provenance": turn_trust}))
-        return JSONResponse(content=_completion(content, {
-            "prompt_tokens": in_tok, "completion_tokens": out_tok,
-            "total_tokens": in_tok + out_tok}))
+        return adapter.answer(content, in_tok, out_tok)
+
+    chat_adapter = ChatCompletionsAdapter()
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request):
+        body = await request.json()
+        session = get_session(request)
+        req = chat_adapter.parse_request(body, Message)
+        return run_pipeline(chat_adapter, up, req, session)
 
     return app
